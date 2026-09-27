@@ -167,7 +167,7 @@ function App() {
 
     try {
       const response = await fetch(
-        "http://localhost:5000/api/campaign",
+        "https://ai-marketing-campaign-optimizer.onrender.com/api/campaign",
         {
           method: "POST",
           headers: {
