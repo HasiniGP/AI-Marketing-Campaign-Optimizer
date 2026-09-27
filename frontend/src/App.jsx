@@ -61,31 +61,35 @@ function App() {
     try { return JSON.parse(localStorage.getItem("aiMarketingSettings") || "{}"); } catch { return {}; }
   });
 
-  // Load campaigns from MongoDB through the backend.
+  const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:5000";
+
+  const normalizeCampaign = (campaign) => ({
+    id: campaign._id || campaign.id,
+    createdAt: campaign.createdAt,
+    product: campaign.product || "",
+    budget: Number(campaign.budget || 0),
+    location: campaign.location || "",
+    interests: campaign.interests || "",
+    age: campaign.age || "",
+    gender: campaign.gender || "All",
+    goal: campaign.goal || "Sales",
+    platforms: Array.isArray(campaign.platforms) ? campaign.platforms : [],
+    additionalDetails: campaign.additionalDetails || "",
+    result: campaign.aiResult || campaign.result || {},
+  });
+
   const loadCampaigns = async () => {
     try {
-      const response = await fetch("http://localhost:5000/api/campaigns");
+      const response = await fetch(`${API_BASE_URL}/api/campaigns`);
       const data = await response.json();
 
       if (!response.ok) {
-        throw new Error(data.message || "Could not load campaigns");
+        throw new Error(data.message || "Failed to load campaigns");
       }
 
-      const mongoCampaigns = Array.isArray(data)
-        ? data
-        : (data.campaigns || []);
-
-      setCampaigns(
-        mongoCampaigns.map((campaign) => ({
-          ...campaign,
-          id: campaign._id || campaign.id,
-          createdAt: campaign.createdAt || new Date().toISOString(),
-          result: campaign.result || campaign.aiResult || {},
-        }))
-      );
+      setCampaigns(Array.isArray(data) ? data.map(normalizeCampaign) : []);
     } catch (error) {
-      console.error("Campaign history loading error:", error);
-      alert("Could not load campaign history from MongoDB. Please make sure the backend is running.");
+      console.error("Campaign history error:", error);
     }
   };
 
@@ -167,7 +171,7 @@ function App() {
 
     try {
       const response = await fetch(
-        "https://ai-marketing-campaign-optimizer.onrender.com/api/campaign",
+        `${API_BASE_URL}/api/campaign`,
         {
           method: "POST",
           headers: {
@@ -195,8 +199,8 @@ function App() {
 
       setResult(data);
 
-      // The backend saves the campaign to MongoDB.
-      // Refresh the campaign list so the UI displays the database record.
+      // The backend saves the campaign in MongoDB.
+      // Reload the history so the Campaigns page uses MongoDB data.
       await loadCampaigns();
     } catch (error) {
       console.error("Optimization error:", error);
@@ -947,7 +951,8 @@ function App() {
     setGender(c.gender || "All");
     setGoal(c.goal || "Sales");
     setPlatforms(c.platforms || []);
-    setResult(c.result || c.aiResult || null);
+    setAdditionalDetails(c.additionalDetails || "");
+    setResult(c.result || null);
     setActivePage("Create Campaign");
   };
 
