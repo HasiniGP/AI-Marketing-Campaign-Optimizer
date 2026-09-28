@@ -1,18 +1,58 @@
 const express = require("express");
 const cors = require("cors");
+const mongoose = require("mongoose");
 require("dotenv").config();
 
 const { GoogleGenAI } = require("@google/genai");
-const mongoose = require("mongoose");
 
 const app = express();
-const PORT = 5000;
+const PORT = process.env.PORT || 5000;
+
+// ==================================================
+// GEMINI MODELS
+// ==================================================
+
+// Use current stable models.
+// The first model is the primary model.
+// The others are fallbacks if the first one fails.
+const MODELS = [
+  "gemini-3.8-flash",
+  "gemini-3.7-flash",
+  "gemini-3.6-flash",
+  "gemini-3.5-flash",
+  "gemini-3.5-flash-lite",
+];
+
+// ==================================================
+// MIDDLEWARE
+// ==================================================
+
+app.use(cors());
+app.use(express.json({ limit: "2mb" }));
+
+// ==================================================
+// GEMINI SETUP
+// ==================================================
+
+console.log("====================================");
+console.log("AI Marketing Campaign Optimizer");
+console.log("====================================");
+
+if (!process.env.GEMINI_API_KEY) {
+  console.error("ERROR: GEMINI_API_KEY is missing from .env");
+} else {
+  console.log("Gemini API key loaded successfully.");
+}
+
+const ai = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY,
+});
 
 // ==================================================
 // MONGODB SETUP
 // ==================================================
 
-const MONGODB_URI = process.env.MONGODB_URI;
+let mongoConnected = false;
 
 const campaignSchema = new mongoose.Schema(
   {
@@ -73,20 +113,18 @@ const campaignSchema = new mongoose.Schema(
 
 const Campaign = mongoose.model("Campaign", campaignSchema);
 
-let mongoConnected = false;
-
 // ==================================================
-// CONNECT TO MONGODB
+// CONNECT MONGODB
 // ==================================================
 
 async function connectMongoDB() {
-  if (!MONGODB_URI) {
+  if (!process.env.MONGODB_URI) {
     console.error("ERROR: MONGODB_URI is missing from .env");
     return;
   }
 
   try {
-    await mongoose.connect(MONGODB_URI);
+    await mongoose.connect(process.env.MONGODB_URI);
 
     mongoConnected = true;
 
@@ -94,71 +132,30 @@ async function connectMongoDB() {
   } catch (error) {
     mongoConnected = false;
 
-    console.error("MongoDB connection failed:");
+    console.error("MongoDB connection failed.");
     console.error(error.message);
   }
 }
-
-// ==================================================
-// GEMINI MODELS
-// ==================================================
-
-const MODELS = [
-  "gemini-3.5-flash-lite",
-  "gemini-3.5-flash",
-  "gemini-3.6-flash",
-];
-
-// ==================================================
-// MIDDLEWARE
-// ==================================================
-
-app.use(cors());
-
-app.use(express.json());
-
-// ==================================================
-// GEMINI SETUP
-// ==================================================
-
-console.log("====================================");
-console.log("AI Marketing Campaign Optimizer");
-console.log("====================================");
-
-if (!process.env.GEMINI_API_KEY) {
-  console.error(
-    "ERROR: GEMINI_API_KEY is missing from .env"
-  );
-} else {
-  console.log(
-    "Gemini API key loaded successfully."
-  );
-}
-
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-});
 
 // ==================================================
 // BASIC ROUTES
 // ==================================================
 
 app.get("/", (req, res) => {
-  res.send(
-    "AI Marketing Campaign Optimizer Backend is running!"
-  );
+  res.send("AI Marketing Campaign Optimizer Backend is running!");
 });
+
+// ==================================================
+// HEALTH CHECK
+// ==================================================
 
 app.get("/api/health", (req, res) => {
   res.json({
     status: "OK",
     message: "Backend is running",
-    geminiConfigured:
-      !!process.env.GEMINI_API_KEY,
-    mongodbConfigured:
-      !!process.env.MONGODB_URI,
-    mongodbConnected:
-      mongoConnected,
+    geminiConfigured: !!process.env.GEMINI_API_KEY,
+    mongodbConfigured: !!process.env.MONGODB_URI,
+    mongodbConnected: mongoConnected,
   });
 });
 
@@ -167,20 +164,16 @@ app.get("/api/health", (req, res) => {
 // ==================================================
 
 function wait(ms) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ==================================================
-// ERROR CHECKING
+// TEMPORARY ERROR CHECK
 // ==================================================
 
 function isTemporaryError(error) {
   const status = error?.status;
-
-  const message =
-    error?.message || String(error);
+  const message = error?.message || String(error);
 
   return (
     status === 408 ||
@@ -194,134 +187,164 @@ function isTemporaryError(error) {
   );
 }
 
-function isQuotaError(error) {
-  const status = error?.status;
+// ==================================================
+// GEMINI RESPONSE TEXT HELPER
+// ==================================================
 
-  const message =
-    error?.message || String(error);
+function getResponseText(response) {
+  try {
+    if (typeof response?.text === "string") {
+      return response.text;
+    }
 
-  return (
-    status === 429 ||
-    /429|RESOURCE_EXHAUSTED|quota|exceeded your current quota/i.test(
-      message
-    )
-  );
+    if (typeof response?.text === "function") {
+      return response.text();
+    }
+
+    return "";
+  } catch (error) {
+    console.error("Could not read Gemini response text.");
+    return "";
+  }
 }
 
 // ==================================================
-// GEMINI MODEL FALLBACK
+// CLEAN JSON FROM GEMINI
+// ==================================================
+
+function cleanJsonText(text) {
+  if (!text) return "";
+
+  let cleaned = String(text).trim();
+
+  // Remove markdown code fences
+  cleaned = cleaned
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+
+  // Sometimes Gemini may return text before/after JSON.
+  const firstBrace = cleaned.indexOf("{");
+  const lastBrace = cleaned.lastIndexOf("}");
+
+  if (firstBrace !== -1 && lastBrace !== -1) {
+    cleaned = cleaned.substring(firstBrace, lastBrace + 1);
+  }
+
+  return cleaned.trim();
+}
+
+// ==================================================
+// GEMINI FALLBACK
 // ==================================================
 
 async function generateWithFallback(prompt) {
   let lastError = null;
 
   for (const model of MODELS) {
-    console.log("\n------------------------------------");
-    console.log(
-      `Trying Gemini model: ${model}`
-    );
+    console.log("------------------------------------");
+    console.log(`Trying Gemini model: ${model}`);
     console.log("------------------------------------");
 
     try {
-      console.log(
-        `Sending request to ${model}...`
-      );
+      const response = await ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          temperature: 0.55,
+        },
+      });
 
-      const response =
-        await ai.models.generateContent({
-          model: model,
+      const responseText = getResponseText(response);
 
-          contents: prompt,
+      if (!responseText) {
+        throw new Error(
+          `Gemini returned an empty response from ${model}`
+        );
+      }
 
-          config: {
-            responseMimeType:
-              "application/json",
-
-            temperature: 0.4,
-          },
-        });
-
-      console.log(
-        `SUCCESS: Response received from ${model}`
-      );
+      console.log(`SUCCESS: ${model}`);
 
       return response;
     } catch (error) {
       lastError = error;
 
       const status = error?.status;
+      const message = error?.message || String(error);
 
-      const message =
-        error?.message || String(error);
-
-      console.error(
-        `FAILED: ${model}`
-      );
-
+      console.error(`FAILED: ${model}`);
       console.error(message);
 
       // ------------------------------------------
       // QUOTA ERROR
       // ------------------------------------------
 
-      if (isQuotaError(error)) {
-        console.log(
-          `${model} quota unavailable.`
-        );
-
-        console.log(
-          "Moving to next Gemini model..."
-        );
-
+      if (
+        status === 429 ||
+        /RESOURCE_EXHAUSTED|quota|exceeded your current quota/i.test(
+          message
+        )
+      ) {
+        console.log("Quota unavailable.");
+        console.log("Trying next Gemini model...");
         continue;
       }
 
       // ------------------------------------------
-      // TEMPORARY SERVER ERROR
+      // MODEL NOT FOUND / INVALID MODEL
+      // ------------------------------------------
+
+      if (
+        status === 400 ||
+        status === 404 ||
+        /not found|not_found|invalid.*model|model.*not found/i.test(
+          message
+        )
+      ) {
+        console.log("Model unavailable.");
+        console.log("Trying next Gemini model...");
+        continue;
+      }
+
+      // ------------------------------------------
+      // TEMPORARY ERROR
       // ------------------------------------------
 
       if (isTemporaryError(error)) {
-        console.log(
-          `${model} temporarily unavailable.`
-        );
-
-        console.log(
-          "Retrying once after 2 seconds..."
-        );
+        console.log("Temporary Gemini error.");
+        console.log("Retrying once...");
 
         await wait(2000);
 
         try {
-          console.log(
-            `Retrying ${model}...`
-          );
-
           const retryResponse =
             await ai.models.generateContent({
-              model: model,
-
+              model,
               contents: prompt,
-
               config: {
-                responseMimeType:
-                  "application/json",
-
-                temperature: 0.4,
+                responseMimeType: "application/json",
+                temperature: 0.55,
               },
             });
 
-          console.log(
-            `SUCCESS: Retry worked with ${model}`
-          );
+          const retryText =
+            getResponseText(retryResponse);
+
+          if (!retryText) {
+            throw new Error(
+              `Gemini returned an empty response on retry from ${model}`
+            );
+          }
+
+          console.log(`SUCCESS ON RETRY: ${model}`);
 
           return retryResponse;
         } catch (retryError) {
           lastError = retryError;
 
-          console.error(
-            `Retry failed for ${model}.`
-          );
-
+          console.error("Retry failed.");
           console.error(
             retryError?.message ||
               String(retryError)
@@ -332,321 +355,142 @@ async function generateWithFallback(prompt) {
       }
 
       // ------------------------------------------
-      // OTHER ERROR
+      // ANY OTHER ERROR
       // ------------------------------------------
 
       console.log(
-        `Unexpected error with ${model}.`
+        "Gemini request failed. Trying next model..."
       );
 
-      console.log(
-        "Moving to next model..."
-      );
+      continue;
     }
   }
 
-  throw lastError;
-}
-
-// ==================================================
-// SAFE FALLBACK RESULT
-// ==================================================
-//
-// This is used only when Gemini is temporarily
-// unavailable or the quota is exhausted.
-//
-// It prevents the campaign submission from failing.
-// It is clearly marked as a fallback estimate.
-//
-
-function createFallbackResult({
-  budget,
-  selectedPlatforms,
-  goal,
-  product,
-}) {
-  const totalBudget =
-    Number(budget) || 0;
-
-  const weights = {
-    Instagram: 35,
-    "Google Ads": 30,
-    YouTube: 20,
-    Facebook: 10,
-    LinkedIn: 5,
-  };
-
-  const allocation = {};
-
-  if (selectedPlatforms.length === 1) {
-    allocation[selectedPlatforms[0]] =
-      "100%";
-  } else {
-    let totalWeight = 0;
-
-    selectedPlatforms.forEach(
-      (platform) => {
-        totalWeight +=
-          weights[platform] || 20;
-      }
-    );
-
-    let assigned = 0;
-
-    selectedPlatforms.forEach(
-      (platform, index) => {
-        if (
-          index ===
-          selectedPlatforms.length - 1
-        ) {
-          allocation[platform] =
-            `${100 - assigned}%`;
-          return;
-        }
-
-        let percentage = Math.round(
-          ((weights[platform] || 20) /
-            totalWeight) *
-            100
-        );
-
-        percentage = Math.max(
-          1,
-          percentage
-        );
-
-        allocation[platform] =
-          `${percentage}%`;
-
-        assigned += percentage;
-      }
-    );
-
-    // Make sure allocation is exactly 100%.
-    let calculatedTotal = 0;
-
-    Object.values(allocation).forEach(
-      (value) => {
-        const number =
-          parseFloat(
-            String(value).replace("%", "")
-          );
-
-        if (!Number.isNaN(number)) {
-          calculatedTotal += number;
-        }
-      }
-    );
-
-    const lastPlatform =
-      selectedPlatforms[
-        selectedPlatforms.length - 1
-      ];
-
-    const lastValue =
-      parseFloat(
-        String(
-          allocation[lastPlatform]
-        ).replace("%", "")
-      );
-
-    allocation[lastPlatform] =
-      `${lastValue + (100 - calculatedTotal)}%`;
-  }
-
-  const predictedROI = 2.5;
-
-  const conversions = Math.max(
-    1,
-    Math.round(
-      totalBudget * 0.008
-    )
+  throw (
+    lastError ||
+    new Error("All Gemini models failed.")
   );
-
-  const revenue = Math.round(
-    totalBudget * predictedROI
-  );
-
-  return {
-    predictedROI:
-      `${predictedROI}x`,
-
-    conversions:
-      conversions,
-
-    revenue:
-      `₹${revenue.toLocaleString(
-        "en-IN"
-      )}`,
-
-    confidence:
-      "65%",
-
-    budgetAllocation:
-      allocation,
-
-    bestTime:
-      "6 PM - 10 PM",
-
-    duration:
-      "14 days",
-
-    audience:
-      `${goal || "Sales"} audience interested in ${
-        product ||
-        "the selected product/service"
-      }.`,
-
-    recommendation:
-      "Gemini is temporarily unavailable. " +
-      "This campaign uses a fallback estimate " +
-      "for demonstration and testing. " +
-      "Actual advertising performance may differ.",
-
-    fallback:
-      true,
-  };
 }
 
 // ==================================================
 // CAMPAIGN OPTIMIZER
 // ==================================================
 
-app.post(
-  "/api/campaign",
-  async (req, res) => {
-    console.log("\n====================================");
-    console.log(
-      "CAMPAIGN REQUEST RECEIVED"
-    );
-    console.log(
-      "====================================");
+app.post("/api/campaign", async (req, res) => {
+  console.log("");
+  console.log("====================================");
+  console.log("CAMPAIGN REQUEST RECEIVED");
+  console.log("====================================");
 
-    try {
-      const {
-        product,
-        budget,
-        goal,
-        location,
-        interests,
-        age,
-        gender,
-        platforms,
-        additionalDetails,
-        details,
-      } = req.body;
+  try {
+    const {
+      product,
+      budget,
+      goal,
+      location,
+      interests,
+      age,
+      gender,
+      platforms,
+      additionalDetails,
+      details,
+    } = req.body;
 
-      const campaignDetails =
-        additionalDetails ||
-        details ||
-        "";
+    const campaignDetails =
+      additionalDetails || details || "";
 
-      console.log(
-        "Product:",
-        product
-      );
+    // ==================================================
+    // VALIDATION
+    // ==================================================
 
-      console.log(
-        "Budget:",
-        budget
-      );
+    if (!product || !budget || !goal) {
+      return res.status(400).json({
+        error: "Missing required campaign information",
+        message:
+          "Product, budget and campaign goal are required.",
+      });
+    }
 
-      console.log(
-        "Goal:",
-        goal
-      );
+    const numericBudget = Number(budget);
 
-      console.log(
-        "Location:",
-        location ||
-          "Not specified"
-      );
+    if (
+      Number.isNaN(numericBudget) ||
+      numericBudget <= 0
+    ) {
+      return res.status(400).json({
+        error: "Invalid budget",
+        message:
+          "Please enter a valid campaign budget.",
+      });
+    }
 
-      console.log(
-        "Age:",
-        age ||
-          "Not specified"
-      );
+    const selectedPlatforms = Array.isArray(platforms)
+      ? platforms.filter(Boolean)
+      : [];
 
-      console.log(
-        "Gender:",
-        gender ||
-          "Not specified"
-      );
+    if (selectedPlatforms.length === 0) {
+      return res.status(400).json({
+        error: "No platform selected",
+        message:
+          "Please select at least one marketing platform.",
+      });
+    }
 
-      console.log(
-        "Interests:",
-        interests ||
-          "Not specified"
-      );
+    const platformText =
+      selectedPlatforms.join(", ");
 
-      console.log(
-        "Platforms:",
-        platforms || []
-      );
+    // ==================================================
+    // DYNAMIC AI PROMPT
+    // ==================================================
 
-      console.log(
-        "Additional Details:",
-        campaignDetails ||
-          "Not specified"
-      );
+    const prompt = `
+You are an expert digital marketing strategist,
+advertising creative director and campaign optimizer.
 
-      // ------------------------------------------
-      // VALIDATION
-      // ------------------------------------------
+Your job is to analyze the user's ACTUAL product or service
+and create a complete marketing campaign specifically for it.
 
-      if (
-        !product ||
-        !budget ||
-        !goal
-      ) {
-        return res.status(400).json({
-          error:
-            "Missing required campaign information",
+IMPORTANT:
 
-          message:
-            "Product, budget and campaign goal are required.",
-        });
-      }
+The product can be ANYTHING.
 
-      const selectedPlatforms =
-        Array.isArray(platforms)
-          ? platforms
-          : [];
+It could be:
+- a physical product
+- a digital product
+- a mobile app
+- a software product
+- a service
+- a restaurant
+- a local business
+- an educational service
+- a fitness service
+- clothing
+- electronics
+- food
+- beauty
+- skincare
+- jewellery
+- furniture
+- travel
+- or any other legitimate product or service.
 
-      if (
-        selectedPlatforms.length === 0
-      ) {
-        return res.status(400).json({
-          error:
-            "No platform selected",
+NEVER assume that the user's product is a smartwatch,
+ice cream, cosmetic, food item, clothing item,
+electronic item or any other fixed category.
 
-          message:
-            "Please select at least one marketing platform.",
-        });
-      }
+First understand the actual product/service.
 
-      const platformText =
-        selectedPlatforms.join(", ");
+Then build the campaign around THAT product/service.
 
-      // ------------------------------------------
-      // AI PROMPT
-      // ------------------------------------------
-
-      const prompt = `
-You are an expert digital marketing campaign optimizer.
-
-Create a professional and practical digital marketing
-campaign strategy based on the information below.
-
+==================================================
 CAMPAIGN INFORMATION
-====================
+==================================================
 
 Product / Service:
 ${product}
 
 Campaign Budget:
-₹${budget}
+₹${numericBudget}
 
 Campaign Goal:
 ${goal}
@@ -669,444 +513,529 @@ ${platformText}
 Additional Campaign Details:
 ${campaignDetails || "Not specified"}
 
+==================================================
+MARKETING RULES
+==================================================
 
-IMPORTANT RULES
-===============
+1. Analyze the actual product/service provided by the user.
 
-1. Analyze this specific campaign.
+2. Do NOT use examples from this prompt as the actual product.
 
-2. Use ONLY the marketing platforms selected by the user.
+3. Create ad content specifically for the user's product/service.
 
-3. Do NOT add platforms that were not selected.
+4. The advertisement must sound natural and realistic.
 
-4. Budget allocation must total exactly 100%.
+5. The headline must be relevant to the actual product/service.
 
-5. If only one platform is selected, give it 100%.
+6. The description must explain the actual product/service.
 
-6. If multiple platforms are selected, distribute the budget
-   realistically between those selected platforms.
+7. Benefits must be relevant to the actual product/service.
 
-7. Predicted ROI, conversions and revenue are estimates only.
+8. CTA must suit the product and campaign goal.
 
-8. Never guarantee marketing results.
+9. Do not mention AI inside the actual advertisement copy.
 
-9. If audience information is missing, make a reasonable
-   marketing assumption.
+10. Do not invent unrealistic technical specifications.
 
-10. Keep the strategy realistic for the given budget.
+11. Do not claim medical, financial or guaranteed results.
 
-11. Return ONLY valid JSON.
+12. If the product is clothing, consider style,
+    comfort, fabric, fit, occasion and appearance.
 
-12. Do not use Markdown.
+13. If the product is food, consider taste,
+    quality, ingredients, convenience and experience.
 
-13. Do not put JSON inside a code block.
+14. If the product is beauty/skincare, use appropriate
+    cosmetic language without unsupported medical claims.
 
-14. Do not add any text before or after the JSON.
+15. If the product is electronics, consider useful features,
+    convenience, design and user experience.
 
+16. If the product is a service, create a service-focused
+    advertisement instead of pretending it is a physical product.
 
-RETURN EXACTLY THIS STRUCTURE
-============================
+17. If the category is unclear, create a professional
+    general product/service advertisement.
+
+18. Use ONLY the platforms selected by the user.
+
+19. Budget allocation must total exactly 100%.
+
+20. If only one platform is selected, give it 100%.
+
+21. Predicted ROI, conversions and revenue are estimates.
+
+22. Never guarantee marketing results.
+
+==================================================
+AD CREATIVE
+==================================================
+
+Create a realistic advertisement concept for the
+actual product/service.
+
+Generate:
+
+- headline
+- short description
+- exactly 3 relevant benefits
+- CTA
+- visual style
+- product category
+- visual direction
+- ad format
+
+The visual direction must be based on the actual
+product/service.
+
+Do not blindly copy example categories.
+
+==================================================
+CAMPAIGN STRATEGY
+==================================================
+
+Also determine:
+
+- predicted ROI
+- estimated conversions
+- estimated revenue
+- confidence level
+- platform budget allocation
+- best advertising time
+- campaign duration
+- target audience
+- overall marketing recommendation
+
+The numbers are estimates and should be reasonable
+for the provided budget, product/service and goal.
+
+==================================================
+RETURN ONLY VALID JSON
+==================================================
+
+Return exactly this structure:
 
 {
   "predictedROI": "3.5x",
   "conversions": 120,
   "revenue": "₹90000",
   "confidence": "85%",
+
   "budgetAllocation": {
     "Instagram": "40%",
     "Google Ads": "35%",
     "LinkedIn": "25%"
   },
+
   "bestTime": "6 PM - 10 PM",
+
   "duration": "14 days",
-  "audience": "Detailed description of the recommended target audience",
-  "recommendation": "Detailed overall marketing strategy"
+
+  "audience": "Detailed recommended target audience",
+
+  "recommendation": "Detailed overall marketing strategy",
+
+  "adHeadline": "Product-specific advertising headline",
+
+  "adDescription": "Short product-specific advertising description",
+
+  "adBenefits": [
+    "Relevant benefit 1",
+    "Relevant benefit 2",
+    "Relevant benefit 3"
+  ],
+
+  "cta": "SHOP NOW",
+
+  "productCategory": "Actual product/service category",
+
+  "visualStyle": "Professional visual style appropriate for the actual product/service",
+
+  "visualDirection": "Detailed description of how the actual product/service should visually appear in the advertisement",
+
+  "adFormat": "Sponsored Product Ad"
 }
 
-The budgetAllocation example is only an example.
+==================================================
+IMPORTANT JSON RULES
+==================================================
 
-Your actual response MUST contain only the platforms
-selected by the user.
-
-The percentages MUST total exactly 100%.
+- Return ONLY JSON.
+- No Markdown.
+- No code fences.
+- No explanation before JSON.
+- No explanation after JSON.
+- Use the exact selected platforms.
+- Budget percentages must total exactly 100%.
+- adHeadline must relate to the actual product/service.
+- adDescription must relate to the actual product/service.
+- adBenefits must contain exactly 3 relevant benefits.
+- productCategory must describe the actual product/service.
+- visualStyle must suit the actual product/service.
+- visualDirection must describe the actual product/service.
 `;
 
-      console.log(
-        "\nSending campaign to Gemini AI..."
+
+    // ==================================================
+    // CALL GEMINI
+    // ==================================================
+
+    console.log("Sending campaign to Gemini...");
+
+    const response =
+      await generateWithFallback(prompt);
+
+    const responseText =
+      getResponseText(response);
+
+    console.log("");
+    console.log("====================================");
+    console.log("GEMINI RESPONSE");
+    console.log("====================================");
+
+    console.log(responseText);
+
+    // ==================================================
+    // PARSE JSON
+    // ==================================================
+
+    let result;
+
+    try {
+      const cleanedText =
+        cleanJsonText(responseText);
+
+      result = JSON.parse(cleanedText);
+    } catch (error) {
+      console.error(
+        "Gemini returned invalid JSON."
       );
 
-      // ------------------------------------------
-      // GEMINI REQUEST
-      // ------------------------------------------
-
-      let response;
-      let responseText;
-
-      try {
-        response =
-          await generateWithFallback(
-            prompt
-          );
-
-        responseText =
-          response.text;
-      } catch (geminiError) {
-        console.error(
-          "\nGemini failed after all available models."
-        );
-
-        console.error(
-          geminiError?.message ||
-            String(geminiError)
-        );
-
-        // ----------------------------------------
-        // FALLBACK FOR 503 / 429 / TEMPORARY ERRORS
-        // ----------------------------------------
-
-        if (
-          isTemporaryError(
-            geminiError
-          ) ||
-          isQuotaError(
-            geminiError
-          )
-        ) {
-          console.log(
-            "Using safe fallback campaign result."
-          );
-
-          const fallbackResult =
-            createFallbackResult({
-              budget,
-              selectedPlatforms,
-              goal,
-              product,
-            });
-
-          // --------------------------------------
-          // SAVE FALLBACK RESULT
-          // --------------------------------------
-
-          if (mongoConnected) {
-            try {
-              await Campaign.create({
-                product,
-
-                budget:
-                  Number(budget),
-
-                goal,
-
-                location:
-                  location || "",
-
-                interests:
-                  interests || "",
-
-                age:
-                  age || "",
-
-                gender:
-                  gender || "All",
-
-                platforms:
-                  selectedPlatforms,
-
-                additionalDetails:
-                  campaignDetails,
-
-                aiResult:
-                  fallbackResult,
-              });
-
-              console.log(
-                "Fallback campaign saved to MongoDB successfully."
-              );
-            } catch (dbError) {
-              console.error(
-                "Fallback campaign could not be saved to MongoDB:"
-              );
-
-              console.error(
-                dbError.message
-              );
-            }
-          }
-
-          return res.json(
-            fallbackResult
-          );
-        }
-
-        throw geminiError;
-      }
-
-      console.log(
-        "\n===================================="
-      );
-
-      console.log(
-        "GEMINI RESPONSE RECEIVED"
-      );
-
-      console.log(
-        "===================================="
-      );
-
-      console.log(
+      console.error(
+        "Raw response:",
         responseText
       );
 
-      // ------------------------------------------
-      // PARSE RESPONSE
-      // ------------------------------------------
+      return res.status(500).json({
+        error: "Invalid AI response",
+        message:
+          "Gemini returned a response that could not be parsed.",
+      });
+    }
 
-      let result;
+    // ==================================================
+    // VALIDATE MAIN RESULT
+    // ==================================================
 
-      try {
-        result =
-          JSON.parse(
-            responseText
-          );
-      } catch (parseError) {
-        console.error(
-          "Normal JSON parsing failed."
-        );
-
-        try {
-          const cleanedText =
-            responseText
-              .replace(
-                /```json/gi,
-                ""
-              )
-              .replace(
-                /```/g,
-                ""
-              )
-              .trim();
-
-          result =
-            JSON.parse(
-              cleanedText
-            );
-        } catch (secondError) {
-          console.error(
-            "Gemini returned invalid JSON."
-          );
-
-          return res.status(500).json({
-            error:
-              "Invalid AI response",
-
-            message:
-              "Gemini returned a response that could not be parsed.",
-          });
-        }
-      }
-
-      // ------------------------------------------
-      // VALIDATE RESULT
-      // ------------------------------------------
-
-      if (
-        !result.predictedROI ||
-        result.conversions ===
-          undefined ||
-        !result.revenue ||
-        !result.confidence ||
-        !result.budgetAllocation ||
-        !result.bestTime ||
-        !result.duration ||
-        !result.audience ||
-        !result.recommendation
-      ) {
-        return res.status(500).json({
-          error:
-            "Incomplete AI response",
-
-          message:
-            "Gemini returned incomplete campaign information.",
-        });
-      }
-
-      // ------------------------------------------
-      // CHECK BUDGET ALLOCATION
-      // ------------------------------------------
-
-      let totalPercentage = 0;
-
-      for (
-        const value of Object.values(
-          result.budgetAllocation
-        )
-      ) {
-        const number =
-          parseFloat(
-            String(value).replace(
-              "%",
-              ""
-            )
-          );
-
-        if (
-          !Number.isNaN(number)
-        ) {
-          totalPercentage +=
-            number;
-        }
-      }
-
-      console.log(
-        `Budget allocation total: ${totalPercentage}%`
-      );
-
-      // ------------------------------------------
-      // FINAL RESULT
-      // ------------------------------------------
-
-      console.log(
-        "\n===================================="
-      );
-
-      console.log(
-        "AI CAMPAIGN RESULT"
-      );
-
-      console.log(
-        "===================================="
-      );
-
-      console.log(
-        result
-      );
-
-      // ------------------------------------------
-      // SAVE CAMPAIGN TO MONGODB
-      // ------------------------------------------
-
-      if (mongoConnected) {
-        try {
-          await Campaign.create({
-            product,
-
-            budget:
-              Number(budget),
-
-            goal,
-
-            location:
-              location || "",
-
-            interests:
-              interests || "",
-
-            age:
-              age || "",
-
-            gender:
-              gender || "All",
-
-            platforms:
-              selectedPlatforms,
-
-            additionalDetails:
-              campaignDetails,
-
-            aiResult:
-              result,
-          });
-
-          console.log(
-            "Campaign saved to MongoDB successfully."
-          );
-        } catch (dbError) {
-          console.error(
-            "Campaign could not be saved to MongoDB:"
-          );
-
-          console.error(
-            dbError.message
-          );
-        }
-      }
-
-      return res.json(
-        result
-      );
-    } catch (error) {
+    if (
+      !result ||
+      !result.predictedROI ||
+      result.conversions === undefined ||
+      !result.revenue ||
+      !result.confidence ||
+      !result.budgetAllocation ||
+      !result.bestTime ||
+      !result.duration ||
+      !result.audience ||
+      !result.recommendation
+    ) {
       console.error(
-        "\n===================================="
-      );
-
-      console.error(
-        "AI OPTIMIZATION ERROR"
-      );
-
-      console.error(
-        "===================================="
-      );
-
-      console.error(
-        error
+        "Gemini returned incomplete campaign information."
       );
 
       return res.status(500).json({
-        error:
-          "AI optimization failed",
-
+        error: "Incomplete AI response",
         message:
-          error?.message ||
-          "Something went wrong while generating the campaign.",
+          "Gemini returned incomplete campaign information.",
       });
     }
+
+    // ==================================================
+    // ENSURE AD DATA EXISTS
+    // ==================================================
+
+    if (!result.adHeadline) {
+      result.adHeadline =
+        `Discover ${product}`;
+    }
+
+    if (!result.adDescription) {
+      result.adDescription =
+        `Discover ${product} designed to meet your needs.`;
+    }
+
+    if (
+      !Array.isArray(result.adBenefits) ||
+      result.adBenefits.length < 3
+    ) {
+      result.adBenefits = [
+        "Quality product or service",
+        "Designed around customer needs",
+        "A practical choice for the target audience",
+      ];
+    }
+
+    // Always keep exactly 3 benefits.
+    result.adBenefits =
+      result.adBenefits.slice(0, 3);
+
+    if (!result.cta) {
+      if (
+        String(goal).toLowerCase().includes("awareness")
+      ) {
+        result.cta = "LEARN MORE";
+      } else if (
+        String(goal).toLowerCase().includes("lead")
+      ) {
+        result.cta = "GET STARTED";
+      } else {
+        result.cta = "SHOP NOW";
+      }
+    }
+
+    if (!result.productCategory) {
+      result.productCategory = "Product / Service";
+    }
+
+    if (!result.visualStyle) {
+      result.visualStyle =
+        "Clean modern product-focused visual";
+    }
+
+    if (!result.visualDirection) {
+      result.visualDirection =
+        `Create a professional advertisement featuring ${product} prominently with a clean, relevant background and product-focused composition.`;
+    }
+
+    if (!result.adFormat) {
+      result.adFormat =
+        "Sponsored Product Ad";
+    }
+
+    // ==================================================
+    // NORMALIZE BUDGET ALLOCATION
+    // ==================================================
+
+    function getPercentage(value) {
+      const number = parseFloat(
+        String(value)
+          .replace("%", "")
+          .trim()
+      );
+
+      return Number.isFinite(number)
+        ? number
+        : null;
+    }
+
+    const cleanedAllocation = {};
+
+    let validAllocation = true;
+
+    selectedPlatforms.forEach((platform) => {
+      if (
+        result.budgetAllocation &&
+        result.budgetAllocation[platform] !== undefined
+      ) {
+        const value =
+          getPercentage(
+            result.budgetAllocation[platform]
+          );
+
+        if (
+          value !== null &&
+          value >= 0
+        ) {
+          cleanedAllocation[platform] =
+            value;
+        } else {
+          validAllocation = false;
+        }
+      } else {
+        validAllocation = false;
+      }
+    });
+
+    const allocationTotal =
+      Object.values(cleanedAllocation).reduce(
+        (sum, value) => sum + value,
+        0
+      );
+
+    // If Gemini did not provide correct allocation,
+    // create our own exact 100% allocation.
+    if (
+      !validAllocation ||
+      Object.keys(cleanedAllocation).length !==
+        selectedPlatforms.length ||
+      Math.abs(allocationTotal - 100) > 0.01
+    ) {
+      console.log(
+        "Normalizing budget allocation..."
+      );
+
+      const count =
+        selectedPlatforms.length;
+
+      const base =
+        Math.floor(100 / count);
+
+      const remainder =
+        100 - base * count;
+
+      selectedPlatforms.forEach(
+        (platform, index) => {
+          const percentage =
+            base +
+            (index < remainder ? 1 : 0);
+
+          cleanedAllocation[platform] =
+            `${percentage}%`;
+        }
+      );
+    } else {
+      selectedPlatforms.forEach(
+        (platform) => {
+          cleanedAllocation[platform] =
+            `${cleanedAllocation[platform]}%`;
+        }
+      );
+    }
+
+    result.budgetAllocation =
+      cleanedAllocation;
+
+    // ==================================================
+    // SAVE CAMPAIGN TO MONGODB
+    // ==================================================
+
+    if (mongoConnected) {
+      try {
+        const savedCampaign =
+          await Campaign.create({
+            product,
+            budget: numericBudget,
+            goal,
+            location: location || "",
+            interests: interests || "",
+            age: age || "",
+            gender: gender || "All",
+            platforms: selectedPlatforms,
+            additionalDetails:
+              campaignDetails,
+            aiResult: result,
+          });
+
+        console.log(
+          "Campaign saved successfully."
+        );
+
+        console.log(
+          "MongoDB ID:",
+          savedCampaign._id.toString()
+        );
+      } catch (databaseError) {
+        console.error(
+          "Campaign could not be saved to MongoDB."
+        );
+
+        console.error(
+          databaseError.message
+        );
+      }
+    } else {
+      console.log(
+        "MongoDB is not connected. Campaign was not saved."
+      );
+    }
+
+    // ==================================================
+    // SEND RESULT TO FRONTEND
+    // ==================================================
+
+    console.log("");
+    console.log("====================================");
+    console.log("AI CAMPAIGN RESULT READY");
+    console.log("====================================");
+
+    res.json(result);
+  } catch (error) {
+    console.error("");
+    console.error("====================================");
+    console.error("AI OPTIMIZATION ERROR");
+    console.error("====================================");
+
+    console.error(
+      error?.message || error
+    );
+
+    res.status(500).json({
+      error: "AI optimization failed",
+      message:
+        error?.message ||
+        "Something went wrong while generating the campaign.",
+    });
   }
-);
+});
 
 // ==================================================
 // GET ALL CAMPAIGNS
 // ==================================================
 
-app.get(
-  "/api/campaigns",
-  async (req, res) => {
+app.get("/api/campaigns", async (req, res) => {
+  try {
     if (!mongoConnected) {
-      return res.status(503).json({
-        error:
-          "Database unavailable",
-
-        message:
-          "MongoDB is not connected.",
-      });
+      return res.json([]);
     }
 
-    try {
-      const campaigns =
-        await Campaign.find()
-          .sort({
-            createdAt: -1,
-          });
+    const campaigns =
+      await Campaign.find()
+        .sort({ createdAt: -1 })
+        .lean();
 
-      return res.json(
-        campaigns
-      );
-    } catch (error) {
-      console.error(
-        "Failed to fetch campaigns:",
-        error
-      );
+    const formattedCampaigns =
+      campaigns.map((campaign) => ({
+        id: campaign._id.toString(),
 
-      return res.status(500).json({
-        error:
-          "Failed to fetch campaigns",
+        product: campaign.product,
 
-        message:
-          error.message,
-      });
-    }
+        budget: campaign.budget,
+
+        goal: campaign.goal,
+
+        location: campaign.location,
+
+        interests: campaign.interests,
+
+        age: campaign.age,
+
+        gender: campaign.gender,
+
+        platforms: campaign.platforms,
+
+        additionalDetails:
+          campaign.additionalDetails,
+
+        result: campaign.aiResult,
+
+        createdAt:
+          campaign.createdAt,
+      }));
+
+    res.json(formattedCampaigns);
+  } catch (error) {
+    console.error(
+      "Error loading campaigns:"
+    );
+
+    console.error(error);
+
+    res.status(500).json({
+      error: "Failed to load campaigns",
+      message: error.message,
+    });
   }
-);
+});
 
 // ==================================================
 // DELETE CAMPAIGN
@@ -1115,48 +1044,31 @@ app.get(
 app.delete(
   "/api/campaigns/:id",
   async (req, res) => {
-    if (!mongoConnected) {
-      return res.status(503).json({
-        error:
-          "Database unavailable",
-
-        message:
-          "MongoDB is not connected.",
-      });
-    }
-
     try {
-      const deleted =
-        await Campaign.findByIdAndDelete(
-          req.params.id
-        );
-
-      if (!deleted) {
-        return res.status(404).json({
-          error:
-            "Campaign not found",
+      if (!mongoConnected) {
+        return res.status(503).json({
+          error: "MongoDB not connected",
         });
       }
 
-      return res.json({
-        message:
-          "Campaign deleted successfully",
+      await Campaign.findByIdAndDelete(
+        req.params.id
+      );
 
-        id:
-          req.params.id,
+      res.json({
+        success: true,
+        message:
+          "Campaign deleted successfully.",
       });
     } catch (error) {
       console.error(
-        "Failed to delete campaign:",
+        "Delete campaign error:",
         error
       );
 
-      return res.status(500).json({
-        error:
-          "Failed to delete campaign",
-
-        message:
-          error.message,
+      res.status(500).json({
+        error: "Failed to delete campaign",
+        message: error.message,
       });
     }
   }
@@ -1166,86 +1078,17 @@ app.delete(
 // START SERVER
 // ==================================================
 
-connectMongoDB();
+async function startServer() {
+  await connectMongoDB();
 
-const server =
-  app.listen(
-    PORT,
-    () => {
-      console.log(
-        "\n===================================="
-      );
-
-      console.log(
-        `Backend server running on http://localhost:${PORT}`
-      );
-
-      console.log(
-        `Health check: http://localhost:${PORT}/api/health`
-      );
-
-      console.log(
-        "Waiting for campaign requests..."
-      );
-
-      console.log(
-        "====================================\n"
-      );
-    }
-  );
-
-// ==================================================
-// SERVER ERROR
-// ==================================================
-
-server.on(
-  "error",
-  (error) => {
-    console.error(
-      "SERVER ERROR:"
+  app.listen(PORT, () => {
+    console.log("");
+    console.log("====================================");
+    console.log(
+      `Backend server running on http://localhost:${PORT}`
     );
+    console.log("====================================");
+  });
+}
 
-    if (
-      error.code ===
-      "EADDRINUSE"
-    ) {
-      console.error(
-        `Port ${PORT} is already being used by another process.`
-      );
-    } else {
-      console.error(
-        error
-      );
-    }
-  }
-);
-
-// ==================================================
-// GLOBAL ERRORS
-// ==================================================
-
-process.on(
-  "uncaughtException",
-  (error) => {
-    console.error(
-      "UNCAUGHT EXCEPTION:"
-    );
-
-    console.error(
-      error
-    );
-  }
-);
-
-process.on(
-  "unhandledRejection",
-  (error) => {
-    console.error(
-      "UNHANDLED PROMISE REJECTION:"
-    );
-
-    console.error(
-      error
-    );
-  }
-);
+startServer();
